@@ -1,0 +1,6 @@
+dawdreamer
+flax
+pandas
+requests
+scipy
+tqdm

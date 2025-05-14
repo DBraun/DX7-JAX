@@ -18,10 +18,14 @@ import pandas as pd
 
 
 def parse0to99(b):
+    """
+    Normalize a 7-bit byte to the 0-99 range, matching Dexed's `normparm` behavior.
+    """
     b = b & 0b1111111
-    # assert b <= 99  # todo: this assertion fails a small percentage of the time.
-    b = min(99, b)
-    return b
+    if b <= 99:
+        return b
+    # Dexed maps out-of-range values proportionally: (value/255)*99, then truncated
+    return int((b / 255.0) * 99)
 
 
 # Structure to store operator-specific parameters

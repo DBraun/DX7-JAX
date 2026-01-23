@@ -30,6 +30,16 @@ python parse_dx7.py
 
 If you run it on all of `DX7_AllTheWeb`, then 388,650 presets will be de-duplicated into 44,884.
 
+## Generate JAX/NNX Code
+
+todo: Once DawDreamer is updated, use it instead of the local faust example below:
+
+```bash
+~/GitHub/faust/build/bin/faust algo16.dsp -I ~/GitHub/faust/libraries -I ~/GitHub/faust/libraries/dx7/ -lang jax -a ~/GitHub/faust/architecture/jax/minimal.py -cn DX7Algo16 -o algo16.py
+```
+
+The previous script created algo16.py, which is very large! What's important is that it contains an `nnx.Module` named `DX7Algo16`.
+
 ## Render an audio dataset
 
 Render the audio with default args (`python dx7_render.py --help` for help)

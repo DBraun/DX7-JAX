@@ -162,3 +162,4 @@ cython_debug/
 DX7_AllTheWeb
 output_dx7
 dx7_patches.csv
+algo*.py

@@ -1,281 +1,200 @@
-from functools import partial
+"""
+DX7 Batch Renderer using NNX-based Faust JAX backend.
+
+Renders DX7 patches from CSV to WAV files using pre-generated algorithm modules.
+Uses jax.vmap for high-throughput batched rendering.
+"""
 from pathlib import Path
-import timeit
 import argparse
+import importlib
 import os
-import math
 
 import numpy as np
-
-import jax.numpy as jnp
 import jax
-from jax import random
-
-import flax.linen as nn
-
+from jax import numpy as jnp, random
+from flax import nnx
 from scipy.io import wavfile
-
 import pandas as pd
-
 from tqdm.auto import trange
 
-from dawdreamer.faust.box import boxFromDSP, boxToSource
-from dawdreamer.faust import FaustContext
+
+# CSV column to NNX label mapping
+CSV_TO_LABEL = {
+    # Global LFO
+    'global/lfoAMD': 'DX7/Global/LFO/AMD',
+    'global/lfoDelay': 'DX7/Global/LFO/Delay',
+    'global/lfoPMD': 'DX7/Global/LFO/PMD',
+    'global/lfoPitchModSens': 'DX7/Global/LFO/P Mod Sens',
+    'global/lfoSpeed': 'DX7/Global/LFO/Speed',
+    'global/lfoSync': 'DX7/Global/LFO/Sync',
+    'global/lfoWave': 'DX7/Global/LFO/Wave',
+    # Global Main
+    'global/feedback': 'DX7/Global/Main/Feedback',
+    'global/oscKeySync': 'DX7/Global/Main/Osc Key Sync',
+    'global/transpose': 'DX7/Global/Main/Transpose',
+    # Global Pitch EG
+    **{f'global/pegL{i}': f'DX7/Global/Pitch EG Levels/L{i}' for i in range(1, 5)},
+    **{f'global/pegR{i}': f'DX7/Global/Pitch EG Rates/R{i}' for i in range(1, 5)},
+}
+
+# Add operator parameters for operators 1-6
+for op in range(1, 7):
+    CSV_TO_LABEL.update({
+        **{f'op{op}/egL{i}': f'DX7/Operator {op}/Amp Env Generator/Levels/L{i}' for i in range(1, 5)},
+        **{f'op{op}/egR{i}': f'DX7/Operator {op}/Amp Env Generator/Rates/R{i}' for i in range(1, 5)},
+        f'op{op}/ampModSens': f'DX7/Operator {op}/Level/A Mod Sens',
+        f'op{op}/touchSensitivity': f'DX7/Operator {op}/Level/Key Vel',
+        f'op{op}/totalLev': f'DX7/Operator {op}/Level/Level',
+        f'op{op}/rateScaling': f'DX7/Operator {op}/Level/Rate Scaling',
+        f'op{op}/breakPoint': f'DX7/Operator {op}/Breakpoint/Breakpoint',
+        f'op{op}/leftDepth': f'DX7/Operator {op}/Breakpoint/L Depth',
+        f'op{op}/rightDepth': f'DX7/Operator {op}/Breakpoint/R Depth',
+        f'op{op}/leftCurve': f'DX7/Operator {op}/Breakpoint/L Curve',
+        f'op{op}/rightCurve': f'DX7/Operator {op}/Breakpoint/R Curve',
+        f'op{op}/detune': f'DX7/Operator {op}/Tone/Tune',
+        f'op{op}/freqCoarse': f'DX7/Operator {op}/Tone/Coarse',
+        f'op{op}/freqFine': f'DX7/Operator {op}/Tone/Fine',
+        f'op{op}/freqMode': f'DX7/Operator {op}/Tone/Freq Mode',
+    })
 
 
-def note_number_to_hz(note_number):
-    return 440.0 * (2.0 ** ((note_number - 69) / 12.0))
+def note_to_hz(note: int) -> float:
+    """Convert MIDI note number to frequency in Hz."""
+    return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
-def note_to_tensor(note, gain, note_dur, total_dur):
-    # Return 2D tensor shaped (3, total_dur) where
-    # 1st dimension is (freq, gain, gate)
-    # and 2nd dimension is audio sample
-    tensor = jnp.zeros((3, total_dur))
-
-    # set freq and gain
-    freq = note_number_to_hz(note)
-    tensor = tensor.at[:2, :].set(
-        jnp.array([freq, gain]).reshape(2, 1))
-
-    # set gate
-    tensor = tensor.at[2, :note_dur].set(jnp.array([1]))
-    return tensor
+def create_inputs(note: int, note_samples: int, total_samples: int) -> jnp.ndarray:
+    """Create input tensor (freq, gain, gate) for DX7 synth."""
+    inputs = jnp.zeros((3, total_samples))
+    inputs = inputs.at[0, :].set(note_to_hz(note))  # freq
+    inputs = inputs.at[1, :].set(1.0)               # gain
+    inputs = inputs.at[2, :note_samples].set(1.0)   # gate
+    return inputs
 
 
-def transform_k_v(k, v):
-    if 'Levels/' in k or 'Rates/' in k:
-        v = jnp.interp(v, jnp.array([0, 99]), jnp.array([-1., 1.]))
-    elif 'LFO/AMD' in k or 'LFO/PMD' in k or 'LFO/Delay' in k or 'LFO/Speed' in k:
-        v = jnp.interp(v, jnp.array([0, 99]), jnp.array([-1., 1.]))
-    elif 'LFO/Pitch Mod Sens' in k:
-        v = jnp.interp(v, jnp.array([0, 7]), jnp.array([-1., 1.]))
-    elif 'LFO/Sync' in k:
-        v = jnp.interp(v, jnp.array([0, 1]), jnp.array([-1., 1.]))
-    elif 'LFO/Wave' in k:
-        v = nn.one_hot(v, num_classes=6)
-    elif 'Feedback' in k:
-        v = jnp.interp(v, jnp.array([0, 7]), jnp.array([-1., 1.]))
-    elif 'Osc Key Sync' in k:
-        v = jnp.interp(v, jnp.array([0, 1]), jnp.array([-1., 1.]))
-    elif 'Transpose' in k:
-        v = jnp.interp(v, jnp.array([-24, 24]), jnp.array([-1., 1.]))
-
-    # non global / Operator (1-6) parameters
-    elif 'AmpModSens' in k:
-        v = jnp.interp(v, jnp.array([0, 3]), jnp.array([-1., 1.]))
-    elif 'KeyVelSens' in k:
-        v = jnp.interp(v, jnp.array([0, 7]), jnp.array([-1., 1.]))
-    elif 'Other/Level' in k:
-        v = jnp.interp(v, jnp.array([0, 99]), jnp.array([-1., 1.]))
-    elif 'Other/Freq Mode' in k:
-        v = jnp.interp(v, jnp.array([0, 1]), jnp.array([-1., 1.]))
-    elif 'Other/Rate Scale' in k:
-        v = jnp.interp(v, jnp.array([0, 7]), jnp.array([-1., 1.]))
-
-    elif 'Break Point/Break Point' in k or 'Break Point/Left Depth' in k or 'Break Point/Right Depth' in k:
-        v = jnp.interp(v, jnp.array([0, 99]), jnp.array([-1., 1.]))
-    elif 'Break Point/Left Curve' in k or 'Break Point/Right Curve' in k:
-        v = nn.one_hot(v, num_classes=4)
-
-    elif 'Tone/Detune' in k:
-        v = jnp.interp(v, jnp.array([0, 14]), jnp.array([-1., 1.]))
-    elif 'Tone/Freq Coarse' in k:
-        v = nn.one_hot(v, num_classes=32)
-    elif 'Tone/Freq Fine' in k:
-        v = nn.one_hot(v, num_classes=100)
-    else:
-        raise ValueError(f'Unrecognized key {k}')
-    return v
-
-
-def dx7_render(patches_df, algorithm: int, batch_size: int, sample_rate: int, note: int, note_dur: float,
-               record_dur: float, do_normalize: bool, output_directory):
-
-    # Note: algorithm is in range [0-31]
-
-    # Note: It is possible to render different algorithms within the same batch. It might make sense to do this
-    # if you only have a few presets to render, and they use different algorithms.
-    # We assume we'll render a lot of presets, so we compile a different JAX module for each algorithm.
-    df = patches_df[patches_df["global/algorithm"] == algorithm]
-
-    df = df.drop(columns=["filename", "name"])
-    df = df.drop(columns=["global/algorithm"])
-
-    if not df.shape[0]:
-        return
-    
-    rename_mapper = {
-        'global/lfoAMD': '_DX7/Global/LFO/AMD',
-        'global/lfoDelay': '_DX7/Global/LFO/Delay',
-        'global/lfoPMD': '_DX7/Global/LFO/PMD',
-        'global/lfoPitchModSens': '_DX7/Global/LFO/Pitch Mod Sens',
-        'global/lfoSpeed': '_DX7/Global/LFO/Speed',
-        'global/lfoSync': '_DX7/Global/LFO/Sync',
-        'global/lfoWave': '_DX7/Global/LFO/Wave',
-
-        'global/algorithm': '_DX7/Global/Main/Algorithm',
-        'global/feedback': '_DX7/Global/Main/Feedback',
-        'global/oscKeySync': '_DX7/Global/Main/Osc Key Sync',
-        'global/transpose': '_DX7/Global/Main/Transpose',
-
-        'global/pegL1': '_DX7/Global/Pitch Env Generator Levels/L1',
-        'global/pegL2': '_DX7/Global/Pitch Env Generator Levels/L2',
-        'global/pegL3': '_DX7/Global/Pitch Env Generator Levels/L3',
-        'global/pegL4': '_DX7/Global/Pitch Env Generator Levels/L4',
-        'global/pegR1': '_DX7/Global/Pitch Env Generator Rates/R1',
-        'global/pegR2': '_DX7/Global/Pitch Env Generator Rates/R2',
-        'global/pegR3': '_DX7/Global/Pitch Env Generator Rates/R3',
-        'global/pegR4': '_DX7/Global/Pitch Env Generator Rates/R4',
+def csv_row_to_labels(row: dict) -> dict:
+    """Convert CSV row to dict keyed by NNX labels."""
+    return {
+        CSV_TO_LABEL[col]: float(row[col])
+        for col in CSV_TO_LABEL
+        if col in row
     }
 
-    for i in range(1, 7):
-        rename_mapper.update(
-            {
-                f'op{i}/egL1': f'_DX7/Operator {i}/Amp Env Generator/Levels/L1',
-                f'op{i}/egL2': f'_DX7/Operator {i}/Amp Env Generator/Levels/L2',
-                f'op{i}/egL3': f'_DX7/Operator {i}/Amp Env Generator/Levels/L3',
-                f'op{i}/egL4': f'_DX7/Operator {i}/Amp Env Generator/Levels/L4',
 
-                f'op{i}/ampModSens': f'_DX7/Operator {i}/Amp Env Generator/Other/AmpModSens',
-                f'op{i}/touchSensitivity': f'_DX7/Operator {i}/Amp Env Generator/Other/KeyVelSens',
-                f'op{i}/totalLev': f'_DX7/Operator {i}/Amp Env Generator/Other/Level',
-                f'op{i}/freqMode': f'_DX7/Operator {i}/Amp Env Generator/Other/Freq Mode',
-                f'op{i}/rateScaling': f'_DX7/Operator {i}/Amp Env Generator/Other/Rate Scale',
+def stack_params(rows: list[dict], model) -> dict:
+    """Stack parameters from multiple rows into batched param dict for vmap."""
+    params_list = [
+        model.with_defaults(model.params_from_labels(csv_row_to_labels(row)))
+        for row in rows
+    ]
+    return {
+        key: jnp.stack([p[key] for p in params_list])
+        for key in params_list[0]
+    }
 
-                f'op{i}/egR1': f'_DX7/Operator {i}/Amp Env Generator/Rates/R1',
-                f'op{i}/egR2': f'_DX7/Operator {i}/Amp Env Generator/Rates/R2',
-                f'op{i}/egR3': f'_DX7/Operator {i}/Amp Env Generator/Rates/R3',
-                f'op{i}/egR4': f'_DX7/Operator {i}/Amp Env Generator/Rates/R4',
 
-                f'op{i}/breakPoint': f'_DX7/Operator {i}/Break Point/Break Point',
-                f'op{i}/leftCurve': f'_DX7/Operator {i}/Break Point/Left Curve',
-                f'op{i}/leftDepth': f'_DX7/Operator {i}/Break Point/Left Depth',
-                f'op{i}/rightCurve': f'_DX7/Operator {i}/Break Point/Right Curve',
-                f'op{i}/rightDepth': f'_DX7/Operator {i}/Break Point/Right Depth',
+def dx7_render(patches_df, algorithm: int, batch_size: int, sample_rate: int,
+               note: int, note_dur: float, record_dur: float,
+               do_normalize: bool, output_directory, limit: int = None):
+    """Render DX7 patches for a specific algorithm."""
+    # Filter by algorithm (0-indexed in CSV, 1-indexed in Faust)
+    df = patches_df[patches_df["global/algorithm"] == algorithm]
+    df = df.drop(columns=["filename", "name", "global/algorithm"])
 
-                f'op{i}/detune': f'_DX7/Operator {i}/Tone/Detune',
-                f'op{i}/freqCoarse': f'_DX7/Operator {i}/Tone/Freq Coarse',
-                f'op{i}/freqFine': f'_DX7/Operator {i}/Tone/Freq Fine',
-            }
-        )
+    if df.empty:
+        return
 
-    df.rename(columns=rename_mapper, inplace=True)
+    # Limit number of presets if specified
+    if limit is not None and limit < len(df):
+        df = df.iloc[:limit]
 
-    # convert from seconds to samples
-    record_dur = int(sample_rate*record_dur)
-    note_dur = int(sample_rate*note_dur)
+    algo_num = algorithm + 1
+    try:
+        algo_module = importlib.import_module(f'algo{algo_num}')
+        ModelClass = getattr(algo_module, f'DX7Algo{algo_num}')
+    except (ImportError, AttributeError) as e:
+        print(f"Skipping algorithm {algo_num}: {e}")
+        return
 
-    tensor = note_to_tensor(note, 1, note_dur, record_dur)
-    tensor = jnp.expand_dims(tensor, axis=0)
+    # Create model
+    model = ModelClass(sample_rate=sample_rate, rngs=nnx.Rngs(0, params=0, rng_stream=0))
+    model.eval()
 
-    tensor = jnp.tile(tensor, (batch_size, 1, 1))
+    # Create inputs
+    inputs = create_inputs(note, int(sample_rate * note_dur), int(sample_rate * record_dur))
 
-    with FaustContext():
+    # Batched render function
+    def render_single(params, rng_key):
+        return model(inputs, params=params, rngs=rng_key)
 
-        dsp_content = f"""
-        custom_dx7 = library("custom_dx7.lib");
+    batched_render = jax.jit(jax.vmap(render_single))
 
-        replace = !,_;
-        process = ["freq":replace, "gain":replace, "gate":replace -> custom_dx7.dx7_algorithm({algorithm+1})] <: _, _;
-        """
+    # Setup output
+    output_dir = Path(output_directory) / f'algo{algo_num}'
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        box = boxFromDSP(dsp_content)
-
-        module_name = 'FaustVoice'
-        jax_code = boxToSource(box, 'jax', module_name, ['-a', 'jax/minimal.py'])
-
-    custom_globals = {}
-    exec(jax_code, custom_globals)  # security risk!
-    MonoVoice = custom_globals[module_name]
-
-    # split parameters but don't split RNGs (DX7 doesn't use RNGs anyway).
-    BatchedVoice = nn.vmap(MonoVoice, in_axes=(0, None), variable_axes={'params': 0}, split_rngs={'params': False})
-
-    batched_model = BatchedVoice(sample_rate=sample_rate)
-
-    # optional shuffle
+    # Shuffle and pad to batch_size multiple
     df = df.sample(frac=1, ignore_index=True)
+    total_presets = len(df)
+    if len(df) % batch_size != 0:
+        padding = batch_size - (len(df) % batch_size)
+        df = pd.concat([df, df.iloc[:padding]], ignore_index=True)
 
-    # pad df with additional rows to match batch size evenly
-    assert df.shape[0]
-    total_presets = df.shape[0]
-    while df.shape[0] % batch_size != 0:
-        df = pd.concat([df, df[:batch_size-(total_presets % batch_size)]])
-
-    jit_inference_fn = jax.jit(batched_model.apply, static_argnums=[2])
-
-    # timeit_number = 3
-    # key = random.PRNGKey(0)
-    # key, subkey = random.split(key)
-    # params = batched_model.init({'params': subkey}, tensor, DURATION)['params']
-    # result = timeit.timeit("jit_inference_fn({'params': params}, tensor, DURATION)", number=timeit_number,
-    #                        globals=locals()) / timeit_number
-    # print(f"Time it: {result:.3f} seconds average.")
-
-    output_directory = Path(output_directory) / f'algo{algorithm+1}'
-    os.makedirs(output_directory, exist_ok=True)
-
-    num_batches = math.ceil(total_presets/batch_size)
-
+    # Process batches
     count = 0
-    for batch_i in trange(num_batches, desc="Items Loop"):
+    rng_key = random.key(42)
 
-        params = df[batch_i*batch_size:(batch_i+1)*batch_size].to_dict(orient='list')
-        params = {k: transform_k_v(k, jnp.array(v)) for k, v in params.items()}
+    for batch_start in trange(0, len(df), batch_size, desc=f"Algo {algo_num}"):
+        batch_rows = [row.to_dict() for _, row in df.iloc[batch_start:batch_start + batch_size].iterrows()]
+        batch_params = stack_params(batch_rows, model)
 
-        audio = jit_inference_fn({'params': params}, tensor, record_dur)
-        audio = np.array(audio)
+        rng_key, *batch_keys = random.split(rng_key, batch_size + 1)
+        audio_batch = np.array(batched_render(batch_params, jnp.stack(batch_keys)))
 
         for i in range(batch_size):
-
-            if count < total_presets:
-
-                output_audio = audio[i].T
-
-                if do_normalize:
-                    # normalize peak level
-                    output_audio = output_audio / np.abs(output_audio).max()
-
-                output_path = str(output_directory / f"render_{str(count).zfill(5)}.wav")
-
-                wavfile.write(output_path, sample_rate, output_audio)
-
-                count += 1
+            if count >= total_presets:
+                break
+            audio = audio_batch[i].T
+            if do_normalize and (peak := np.abs(audio).max()) > 0:
+                audio = audio / peak
+            wavfile.write(str(output_dir / f"render_{count:05d}.wav"), sample_rate, audio.astype(np.float32))
+            count += 1
 
 
 def main():
-
-    parser = argparse.ArgumentParser(description="Render many presets of a DX7 synthesizer with JAX.")
-    parser.add_argument("--csv", default="dx7_patches.csv", help="Path to CSV file.")
-    parser.add_argument("--batch-size", default=32, help="Batch size")
-    parser.add_argument( "-sr", "--sample-rate", default=44100, help="Sample rate")
-    parser.add_argument("--note-dur", default=2, help="Note on duration (seconds).")
-    parser.add_argument("--record-dur", default=3, help="Recording duration (seconds).")
-    parser.add_argument("--note", default=48, help="MIDI note to play.")
-    parser.add_argument("--normalize", default=True, action=argparse.BooleanOptionalAction,
-                        help="Toggle for normalizing peak level.")
-    parser.add_argument('--platform', default='cpu', choices=['cpu', 'gpu'])
-    parser.add_argument("-o", "--output-directory", default="output_dx7",
-                        help="Output directory for saved files.")
+    parser = argparse.ArgumentParser(description="Render DX7 presets with JAX.")
+    parser.add_argument("--csv", default="dx7_patches.csv")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("-sr", "--sample-rate", type=int, default=44100)
+    parser.add_argument("--note-dur", type=float, default=2)
+    parser.add_argument("--record-dur", type=float, default=3)
+    parser.add_argument("--note", type=int, default=48)
+    parser.add_argument("--normalize", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--platform", default="cpu", choices=["cpu", "gpu"])
+    parser.add_argument("-o", "--output-directory", default="output_dx7")
+    parser.add_argument("--algorithm", type=int, default=None, help="Algorithm 1-32 (default: all)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of presets to render per algorithm")
     args = parser.parse_args()
 
-    # Global flag to set a specific platform, must be used at startup.
-    jax.config.update('jax_platform_name', args.platform)
+    jax.config.update("jax_platform_name", args.platform)
 
-    patches_csv = args.csv
-    assert os.path.isfile(patches_csv), FileExistsError(f"CSV of patches not found at path: {patches_csv}")
+    if not os.path.isfile(args.csv):
+        raise FileNotFoundError(f"CSV not found: {args.csv}")
 
-    df = pd.read_csv(patches_csv)
+    df = pd.read_csv(args.csv)
 
-    for algorithm in trange(32, desc="Algorithm"):
+    if args.algorithm is not None:
+        if not 1 <= args.algorithm <= 32:
+            raise ValueError("Algorithm must be 1-32")
+        dx7_render(df, args.algorithm - 1, args.batch_size, args.sample_rate,
+                   args.note, args.note_dur, args.record_dur, args.normalize, args.output_directory, args.limit)
+    else:
+        for algo_idx in trange(32, desc="Algorithm"):
+            dx7_render(df, algo_idx, args.batch_size, args.sample_rate,
+                       args.note, args.note_dur, args.record_dur, args.normalize, args.output_directory, args.limit)
 
-        dx7_render(df, algorithm, args.batch_size, args.sample_rate, args.note, args.note_dur, args.record_dur,
-                   args.normalize, args.output_directory)
-
-    print('All done!')
+    print("All done!")
 
 
 if __name__ == "__main__":
-
     main()

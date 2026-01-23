@@ -163,3 +163,11 @@ DX7_AllTheWeb
 output_dx7
 dx7_patches.csv
 algo*.py
+algo*.dsp
+
+# Comparison outputs
+comparison_output/
+comparison_results.csv
+
+# Temporary render scripts
+render.py
